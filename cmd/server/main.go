@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"rtcs/internal/cache"
+	"rtcs/internal/circuitbreaker"
 	"rtcs/internal/config"
 	"rtcs/internal/middleware"
 	"rtcs/internal/repository"
@@ -143,6 +144,12 @@ func main() {
 	})
 	staticRouter.PathPrefix("/").Handler(http.FileServer(http.Dir("public")))
 
+	cbRegistry := initCircuitBreaker()
+
+	cbHandler := transport.NewCircuitBreakerHandler(cbRegistry)
+	router.HandleFunc("/api/circuit-breakers", cbHandler.GetStatus).Methods("GET")
+	router.HandleFunc("/api/circuit-breakers/reset", cbHandler.ResetCircuitBreaker).Methods("POST")
+
 	// Log all registered routes
 	log.Printf("=== Registered Routes ===")
 	err = router.Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
@@ -191,6 +198,7 @@ func main() {
 	}
 
 	log.Println("Server exited properly")
+
 }
 
 func connectDB(url string) (*gorm.DB, error) {
@@ -202,4 +210,15 @@ func connectDB(url string) (*gorm.DB, error) {
 	log.Printf("Connected to database")
 
 	return db, nil
+}
+
+func initCircuitBreaker() *circuitbreaker.Registry {
+	registry := circuitbreaker.NewRegistry()
+
+	// Log all state changes
+	registry.Get("default", circuitbreaker.WithOnStateChange(func(name string, from, to circuitbreaker.State) {
+		log.Printf("[CIRCUIT BREAKER] %s changed from %d to %d", name, from, to)
+	}))
+
+	return registry
 }
