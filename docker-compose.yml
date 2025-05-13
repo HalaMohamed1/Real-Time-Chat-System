@@ -62,7 +62,6 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
-      - "8443:8443"  # HTTPS port
     environment:
       - DOCKER_ENV=true
       - DB_HOST=postgres
@@ -75,9 +74,6 @@ services:
       - MQTT_BROKER=tcp://mqtt:1883
       - MQTT_WEBSOCKET=ws://mqtt:9001
       - PORT=8080
-      - TLS_CERT_PATH=/app/certs/server.crt
-      - TLS_KEY_PATH=/app/certs/server.key
-      - HTTPS_PORT=8443
       - HOST=0.0.0.0
     volumes:
       - ./public:/app/public

@@ -2,10 +2,18 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"rtcs/internal/cache"
+	"rtcs/internal/config"
+	"rtcs/internal/middleware"
+	"rtcs/internal/repository"
+	"rtcs/internal/service"
+	"rtcs/internal/transport"
+	httptransport "rtcs/internal/transport/http"
 	"strings"
 	"syscall"
 	"time"
@@ -14,174 +22,184 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-
-	"rtcs/internal/config"
-	"rtcs/internal/middleware"
-	"rtcs/internal/repository"
-	"rtcs/internal/service"
-	"rtcs/internal/transport"
 )
 
-func main() {
-	// Load configuration
-	cfg := config.Get()
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Llongfile)
+}
 
-	// Connect to database
-	db, err := gorm.Open(postgres.Open(cfg.DatabaseURL), &gorm.Config{})
+func main() {
+	log.Printf("Starting server...")
+
+	// Initialize configuration
+	cfg := config.Get()
+	log.Printf("Configuration loaded")
+
+	// Load OAuth configuration
+	oauthCfg, err := config.LoadOAuthConfig()
+	if err != nil {
+		log.Fatalf("Failed to load OAuth configuration: %v", err)
+	}
+	log.Printf("OAuth configuration loaded")
+
+	// Connect to PostgreSQL
+	db, err := connectDB(cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-
-	// Connect to Redis
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: strings.TrimPrefix(cfg.RedisURL, "redis://"),
-	})
+	log.Printf("Connected to database")
 
 	// Initialize repositories
 	userRepo := repository.NewUserRepository(db)
 	chatRepo := repository.NewChatRepository(db)
+	messageRepo := repository.NewMessageRepository(db)
+	log.Printf("Repositories initialized")
+
+	// Connect to Redis
+	redisURL := cfg.RedisURL
+	if strings.HasPrefix(redisURL, "redis://") {
+		redisURL = strings.TrimPrefix(redisURL, "redis://")
+	}
+	// Remove database number if present
+	if idx := strings.LastIndex(redisURL, "/"); idx != -1 {
+		redisURL = redisURL[:idx]
+	}
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+	messageCache := cache.NewMessageCache(rdb)
+	log.Printf("Connected to Redis")
 
 	// Initialize services
-	authService := service.NewAuthService(userRepo)
+	authService := service.NewAuthService(userRepo, cfg.JWTSecret)
 	chatService := service.NewChatService(chatRepo)
-	statusService := service.NewStatusService(redisClient)
+	messageService := service.NewMessageService(messageRepo, messageCache)
+	statusService := service.NewStatusService(rdb)
 	profileService := service.NewProfileService(userRepo)
+	log.Printf("Services initialized")
 
 	// Initialize handlers
 	authHandler := transport.NewAuthHandler(authService)
-	chatHandler := transport.NewChatHandler(chatService)
 	profileHandler := transport.NewProfileHandler(profileService)
+	chatHandler := transport.NewChatHandler(chatService)
+	messageHandler := transport.NewMessageHandler(messageService)
+	oauthHandler := httptransport.NewOAuthHandler(oauthCfg, authService)
 
-	// Load OAuth config
-	oauthCfg, err := config.LoadOAuthConfig()
-	if err != nil {
-		log.Printf("Warning: OAuth config not loaded: %v", err)
-	}
-	oauthHandler := transport.NewOAuthHandler(oauthCfg, authService)
-
-	// Initialize WebSocket handler
-	wsHandler := transport.NewWebSocketHandler(statusService, profileService)
-
-	// Set up router
+	// Create router
 	router := mux.NewRouter()
 
 	// Public routes
-	router.HandleFunc("/health", transport.HealthCheck).Methods("GET")
-	router.HandleFunc("/api/auth/register", authHandler.Register).Methods("POST")
-	router.HandleFunc("/api/auth/login", authHandler.Login).Methods("POST")
-	router.HandleFunc("/auth/google", oauthHandler.GoogleLogin).Methods("GET")
-	router.HandleFunc("/auth/google/callback", oauthHandler.GoogleCallback).Methods("GET")
+	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("GET")
+
+	// Auth routes
+	authRouter := router.PathPrefix("/auth").Subrouter()
+	authRouter.HandleFunc("/register", authHandler.Register).Methods("POST")
+	authRouter.HandleFunc("/login", authHandler.Login).Methods("POST")
+	authRouter.HandleFunc("/google/login", oauthHandler.GoogleLogin).Methods("GET")
+	authRouter.HandleFunc("/google/callback", oauthHandler.GoogleCallback).Methods("GET")
 
 	// Protected routes
-	apiRouter := router.PathPrefix("/api").Subrouter()
-	apiRouter.Use(middleware.AuthMiddleware())
+	chatRouter := router.PathPrefix("/chats").Subrouter()
+	chatRouter.Use(middleware.Auth(authService))
+	chatRouter.HandleFunc("", chatHandler.CreateChat).Methods("POST")
+	chatRouter.HandleFunc("", chatHandler.ListChats).Methods("GET")
+	chatRouter.HandleFunc("/{chatId}", chatHandler.GetChat).Methods("GET")
+	chatRouter.HandleFunc("/{chatId}/join", chatHandler.JoinChat).Methods("POST")
+	chatRouter.HandleFunc("/{chatId}/leave", chatHandler.LeaveChat).Methods("POST")
 
-	// Chat routes
-	apiRouter.HandleFunc("/chats", chatHandler.CreateChat).Methods("POST")
-	apiRouter.HandleFunc("/chats", chatHandler.ListChats).Methods("GET")
-	apiRouter.HandleFunc("/chats/{chatId}", chatHandler.GetChat).Methods("GET")
-	apiRouter.HandleFunc("/chats/{chatId}/join", chatHandler.JoinChat).Methods("POST")
-	apiRouter.HandleFunc("/chats/{chatId}/leave", chatHandler.LeaveChat).Methods("POST")
+	messageRouter := router.PathPrefix("/messages").Subrouter()
+	messageRouter.Use(middleware.Auth(authService))
+	messageRouter.HandleFunc("", messageHandler.Send).Methods("POST")
+	messageRouter.HandleFunc("/{messageId}", messageHandler.DeleteMessage).Methods("DELETE")
+	messageRouter.HandleFunc("/chat/{chatId}", messageHandler.GetChatHistory).Methods("GET")
 
-	// Profile routes
-	apiRouter.HandleFunc("/profile", profileHandler.GetMyProfile).Methods("GET")
-	apiRouter.HandleFunc("/profile", profileHandler.UpdateProfile).Methods("PUT")
-	apiRouter.HandleFunc("/users/{userId}/profile", profileHandler.GetProfile).Methods("GET")
+	statusRouter := router.PathPrefix("/status").Subrouter()
+	statusRouter.Use(middleware.Auth(authService))
+	statusRouter.HandleFunc("/online", func(w http.ResponseWriter, r *http.Request) {
+		users, err := statusService.GetAllOnlineUsers(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"online_users":` + fmt.Sprintf("%q", users) + `}`))
+	}).Methods("GET")
 
-	// WebSocket route
+	// WebSocket endpoint
+	wsHandler := transport.NewWebSocketHandler(statusService, profileService) // Pass status service
 	router.HandleFunc("/ws", wsHandler.HandleWebSocket)
+	router.HandleFunc("/api/profile", profileHandler.GetMyProfile).Methods("GET")
+	router.HandleFunc("/api/profile", profileHandler.UpdateProfile).Methods("PUT")
+	router.HandleFunc("/api/users/{userId}/profile", profileHandler.GetProfile).Methods("GET")
+	log.Printf("WebSocket endpoint added")
 
-	// Get certificate paths from environment variables or use defaults
-	certPath := os.Getenv("TLS_CERT_PATH")
-	if certPath == "" {
-		certPath = "certs/server.crt"
+	// Serve static files from the public directory (must be last)
+	staticRouter := router.PathPrefix("/").Subrouter()
+	// Serve index.html for root path
+	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "public/index.html")
+	})
+	staticRouter.PathPrefix("/").Handler(http.FileServer(http.Dir("public")))
+
+	// Log all registered routes
+	log.Printf("=== Registered Routes ===")
+	err = router.Walk(func(route *mux.Route, router *mux.Router, ancestors []*mux.Route) error {
+		pathTemplate, err := route.GetPathTemplate()
+		if err != nil {
+			pathTemplate = "<no template>"
+		}
+		methods, err := route.GetMethods()
+		if err != nil {
+			methods = []string{"ANY"}
+		}
+		log.Printf("Route: %s [%s]", pathTemplate, methods)
+		return nil
+	})
+	if err != nil {
+		log.Printf("Error walking routes: %v", err)
 	}
+	log.Printf("======================")
 
-	keyPath := os.Getenv("TLS_KEY_PATH")
-	if keyPath == "" {
-		keyPath = "certs/server.key"
-	}
-
-	// Create an HTTP server with TLS configuration
-	httpsPort := os.Getenv("HTTPS_PORT")
-	if httpsPort == "" {
-		httpsPort = "8443"
-	}
-
-	server := &http.Server{
-		Addr:    ":" + httpsPort,
+	// Create server
+	srv := &http.Server{
+		Addr:    ":8083",
 		Handler: router,
 	}
 
-	// Start HTTP to HTTPS redirect server
-	go startHTTPRedirectServer()
-
-	// Start the HTTPS server
+	// Start server
 	go func() {
-		log.Printf("Starting HTTPS server on %s", server.Addr)
-		if err := server.ListenAndServeTLS(certPath, keyPath); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Could not start HTTPS server: %v", err)
+		log.Printf("Server is running on port 8083")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
 
-	// Set up graceful shutdown
-	gracefulShutdown(server)
-}
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
-// HTTP to HTTPS redirect server
-func startHTTPRedirectServer() {
-	httpPort := os.Getenv("HTTP_PORT")
-	if httpPort == "" {
-		httpPort = "8080"
-	}
-
-	redirectHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		// If the host includes a port, strip it
-		if i := strings.IndexByte(host, ':'); i >= 0 {
-			host = host[:i]
-		}
-
-		httpsPort := os.Getenv("HTTPS_PORT")
-		if httpsPort == "" {
-			httpsPort = "8443"
-		}
-
-		// Construct the HTTPS URL
-		httpsURL := "https://" + host + ":" + httpsPort + r.URL.String()
-		http.Redirect(w, r, httpsURL, http.StatusMovedPermanently)
-	})
-
-	redirectServer := &http.Server{
-		Addr:    ":" + httpPort,
-		Handler: redirectHandler,
-	}
-
-	log.Printf("Starting HTTP redirect server on %s", redirectServer.Addr)
-	if err := redirectServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Printf("HTTP redirect server error: %v", err)
-	}
-}
-
-// Graceful shutdown function
-func gracefulShutdown(server *http.Server) {
-	// Create channel to listen for interrupt signal
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	// Block until interrupt signal is received
-	<-stop
-
-	log.Println("Shutting down server...")
-
-	// Create a deadline for server shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Shutdown server gracefully
+	log.Println("Server is shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Attempt graceful shutdown
-	if err := server.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 
-	log.Println("Server gracefully stopped")
+	log.Println("Server exited properly")
+}
+
+func connectDB(url string) (*gorm.DB, error) {
+	log.Printf("Connecting to database...")
+	db, err := gorm.Open(postgres.Open(url), &gorm.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+	log.Printf("Connected to database")
+
+	return db, nil
 }

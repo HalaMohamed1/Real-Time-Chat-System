@@ -445,7 +445,8 @@
         const config = {
             wsProtocol: window.location.protocol === 'https:' ? 'wss:' : 'ws:',
             wsHost: window.location.hostname,
-            wsPort: window.location.protocol === 'https:' ? '8443' : '8080', // Update ports for HTTPS/HTTP            heartbeatInterval: 5000, // 5 seconds - more frequent heartbeats
+            wsPort: window.location.port || '8083',
+            heartbeatInterval: 5000, // 5 seconds - more frequent heartbeats
             statusUpdateInterval: 5000, // 5 seconds - more frequent status updates
             typingTimeout: 2000 // 2 seconds
         };
