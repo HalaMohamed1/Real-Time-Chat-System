@@ -10,6 +10,7 @@ import (
 	"rtcs/internal/cache"
 	"rtcs/internal/circuitbreaker"
 	"rtcs/internal/config"
+	"rtcs/internal/logging"
 	"rtcs/internal/middleware"
 	"rtcs/internal/repository"
 	"rtcs/internal/service"
@@ -32,10 +33,33 @@ func init() {
 func main() {
 	log.Printf("Starting server...")
 
-	// Initialize configuration
-	cfg := config.Get()
-	log.Printf("Configuration loaded")
+	logConfig := logging.DefaultConfig()
 
+	// Get log level from environment
+	logLevelEnv := os.Getenv("LOG_LEVEL")
+	if logLevelEnv != "" {
+		logConfig.Level = logging.LogLevel(logLevelEnv)
+	}
+
+	// Get log format from environment
+	logFormatEnv := os.Getenv("LOG_FORMAT")
+	if logFormatEnv != "" {
+		logConfig.Format = logFormatEnv
+	}
+
+	logging.Init("rtcs", logConfig)
+	logger := logging.GetLogger()
+
+	logger.Info("Starting Real-Time Chat System", logging.Fields{
+		"version": "1.0.0",
+	})
+
+	// Load configuration
+	cfg := config.Get()
+	logger.Info("Configuration loaded", logging.Fields{
+		"database_url": maskSensitiveInfo(cfg.DatabaseURL),
+		"redis_url":    maskSensitiveInfo(cfg.RedisURL),
+	})
 	// Load OAuth configuration
 	oauthCfg, err := config.LoadOAuthConfig()
 	if err != nil {
@@ -221,4 +245,8 @@ func initCircuitBreaker() *circuitbreaker.Registry {
 	}))
 
 	return registry
+}
+
+func maskSensitiveInfo(input string) string {
+	return "***masked***"
 }
